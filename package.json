@@ -1,0 +1,16 @@
+{
+  "name": "shadow-assassins-backend",
+  "version": "1.0.0",
+  "description": "Backend for the Shadow Assassins multiplayer game.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.4.1",
+    "ws": "^8.17.0"
+  }
+}
