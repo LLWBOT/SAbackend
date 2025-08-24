@@ -11,7 +11,7 @@ const app = express();
 
 // Set up CORS to allow requests ONLY from your Netlify frontend
 const corsOptions = {
-    origin: 'https://shadowassasins.netlify.com'
+    origin: 'https://shadowassasins.netlify.app'
 };
 
 app.use(cors(corsOptions)); // <-- ADD THIS LINE
@@ -25,4 +25,187 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
     .then(() => console.log('Connected to MongoDB Atlas!'))
     .catch(err => console.error('Could not connect to database...', err));
 
-// ... The rest of your server.js code is unchanged ...
+// --- REST API Endpoints ---
+
+// User Signup
+app.post('/api/signup', async (req, res) => {
+    try {
+        const hashedPassword = await bcrypt.hash(req.body.password, 10);
+        const user = new User({
+            username: req.body.username,
+            password: hashedPassword
+        });
+        await user.save();
+        res.status(201).send('User created successfully!');
+    } catch (error) {
+        if (error.code === 11000) {
+            return res.status(400).send('Username already exists.');
+        }
+        res.status(500).send('Error creating user.');
+    }
+});
+
+// User Login
+app.post('/api/login', async (req, res) => {
+    try {
+        const user = await User.findOne({ username: req.body.username });
+        if (!user) {
+            return res.status(404).send('Invalid username or password.');
+        }
+
+        const isMatch = await bcrypt.compare(req.body.password, user.password);
+        if (!isMatch) {
+            return res.status(401).send('Invalid username or password.');
+        }
+
+        const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: '1h' });
+        res.json({ token, username: user.username });
+    } catch (error) {
+        res.status(500).send('Server error.');
+    }
+});
+
+// Update Username
+app.post('/api/update-username', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).send('Authentication failed.');
+    }
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const { newUsername } = req.body;
+
+        const updatedUser = await User.findByIdAndUpdate(
+            decoded.userId, 
+            { username: newUsername }, 
+            { new: true, runValidators: true }
+        );
+
+        if (!updatedUser) {
+            return res.status(404).send('User not found.');
+        }
+        res.send('Username updated successfully.');
+    } catch (error) {
+        if (error.code === 11000) {
+            return res.status(400).send('Username already exists.');
+        }
+        res.status(401).send('Invalid token or unauthorized.');
+    }
+});
+
+// Get Leaderboard
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const topPlayers = await User.find().sort({ points: -1 }).limit(100).select('username points -_id');
+        res.json(topPlayers);
+    } catch (error) {
+        res.status(500).send('Error fetching leaderboard.');
+    }
+});
+
+// --- WebSocket Server ---
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const waitingPlayers = [];
+const activeGames = new Map();
+
+wss.on('connection', ws => {
+    let isAuthenticated = false;
+
+    ws.on('message', async message => {
+        const data = JSON.parse(message);
+
+        // Authentication first
+        if (data.type === 'authenticate' && data.token) {
+            try {
+                const user = jwt.verify(data.token, JWT_SECRET);
+                ws.user = user;
+                isAuthenticated = true;
+                ws.send(JSON.stringify({ type: 'status', message: 'Authentication successful. Searching for opponent...' }));
+
+                waitingPlayers.push(ws);
+
+                if (waitingPlayers.length >= 2) {
+                    const player1 = waitingPlayers.shift();
+                    const player2 = waitingPlayers.shift();
+
+                    const gameId = Math.random().toString(36).substring(7);
+                    activeGames.set(gameId, [player1, player2]);
+
+                    player1.gameId = gameId;
+                    player2.gameId = gameId;
+
+                    player1.send(JSON.stringify({ type: 'matchFound', opponent: player2.user.username }));
+                    player2.send(JSON.stringify({ type: 'matchFound', opponent: player1.user.username }));
+                }
+
+            } catch (err) {
+                ws.close(1008, 'Invalid token.');
+            }
+        } else if (isAuthenticated) {
+            // Game logic after authentication
+            const game = activeGames.get(ws.gameId);
+            if (!game) return;
+
+            const opponent = game.find(p => p !== ws);
+            if (!opponent || opponent.readyState !== WebSocket.OPEN) {
+                // Opponent disconnected, handle win
+                ws.send(JSON.stringify({ type: 'finalResult', status: 'Your opponent disconnected. You win!' }));
+                updateScore(ws.user.username, 10);
+                activeGames.delete(ws.gameId);
+                return;
+            }
+
+            // Forward game actions
+            opponent.send(message);
+
+            // Check for game over (This logic would be more complex in a real game)
+            if (data.type === 'gameover') {
+                const winnerName = data.winner;
+                const loserName = data.loser;
+
+                if (winnerName === ws.user.username) {
+                    updateScore(winnerName, 10);
+                    ws.send(JSON.stringify({ type: 'finalResult', status: 'You won!' }));
+                    opponent.send(JSON.stringify({ type: 'finalResult', status: 'You were defeated.' }));
+                    updateScore(loserName, -5);
+                } else {
+                    updateScore(winnerName, 10);
+                    opponent.send(JSON.stringify({ type: 'finalResult', status: 'You won!' }));
+                    ws.send(JSON.stringify({ type: 'finalResult', status: 'You were defeated.' }));
+                    updateScore(loserName, -5);
+                }
+                activeGames.delete(ws.gameId);
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        // Handle player leaving the queue or an active game
+        const index = waitingPlayers.indexOf(ws);
+        if (index > -1) {
+            waitingPlayers.splice(index, 1);
+        }
+    });
+});
+
+// Update user score function
+const updateScore = async (username, points) => {
+    try {
+        await User.findOneAndUpdate(
+            { username: username },
+            { $inc: { points: points } },
+            { new: true }
+        );
+    } catch (error) {
+        console.error('Error updating score:', error);
+    }
+};
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});
