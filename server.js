@@ -4,30 +4,26 @@ const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const cors = require('cors'); // <-- ADD THIS LINE
+const cors = require('cors');
 const User = require('./models/User');
 
 const app = express();
 
-// Set up CORS to allow requests ONLY from your Netlify frontend
 const corsOptions = {
-    origin: 'https://shadowassasins.netlify.app'
+    origin: 'https://shadowassasins.netlify.com'
 };
 
-app.use(cors(corsOptions)); // <-- ADD THIS LINE
+app.use(cors(corsOptions));
 app.use(express.json());
 
-// Your secret key for JWTs. Use an environment variable in production.
 const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_jwt_key';
 
-// Connect to MongoDB Atlas
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(() => console.log('Connected to MongoDB Atlas!'))
     .catch(err => console.error('Could not connect to database...', err));
 
 // --- REST API Endpoints ---
 
-// User Signup
 app.post('/api/signup', async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(req.body.password, 10);
@@ -45,7 +41,6 @@ app.post('/api/signup', async (req, res) => {
     }
 });
 
-// User Login
 app.post('/api/login', async (req, res) => {
     try {
         const user = await User.findOne({ username: req.body.username });
@@ -65,7 +60,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Update Username
 app.post('/api/update-username', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -94,13 +88,29 @@ app.post('/api/update-username', async (req, res) => {
     }
 });
 
-// Get Leaderboard
 app.get('/api/leaderboard', async (req, res) => {
     try {
         const topPlayers = await User.find().sort({ points: -1 }).limit(100).select('username points -_id');
         res.json(topPlayers);
     } catch (error) {
         res.status(500).send('Error fetching leaderboard.');
+    }
+});
+
+app.get('/api/user/score', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).send('Authentication failed.');
+    }
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const user = await User.findById(decoded.userId).select('points');
+        if (!user) {
+            return res.status(404).send('User not found.');
+        }
+        res.json({ points: user.points });
+    } catch (error) {
+        res.status(401).send('Invalid token or unauthorized.');
     }
 });
 
@@ -118,7 +128,6 @@ wss.on('connection', ws => {
     ws.on('message', async message => {
         const data = JSON.parse(message);
 
-        // Authentication first
         if (data.type === 'authenticate' && data.token) {
             try {
                 const user = jwt.verify(data.token, JWT_SECRET);
@@ -146,23 +155,30 @@ wss.on('connection', ws => {
                 ws.close(1008, 'Invalid token.');
             }
         } else if (isAuthenticated) {
-            // Game logic after authentication
             const game = activeGames.get(ws.gameId);
             if (!game) return;
 
             const opponent = game.find(p => p !== ws);
+
+            if (data.type === 'leave') {
+                if (opponent && opponent.readyState === WebSocket.OPEN) {
+                    opponent.send(JSON.stringify({ type: 'finalResult', status: 'Your opponent left the game. You win!' }));
+                    updateScore(opponent.user.username, 10);
+                }
+                ws.close();
+                activeGames.delete(ws.gameId);
+                return;
+            }
+
             if (!opponent || opponent.readyState !== WebSocket.OPEN) {
-                // Opponent disconnected, handle win
                 ws.send(JSON.stringify({ type: 'finalResult', status: 'Your opponent disconnected. You win!' }));
                 updateScore(ws.user.username, 10);
                 activeGames.delete(ws.gameId);
                 return;
             }
 
-            // Forward game actions
             opponent.send(message);
 
-            // Check for game over (This logic would be more complex in a real game)
             if (data.type === 'gameover') {
                 const winnerName = data.winner;
                 const loserName = data.loser;
@@ -184,15 +200,25 @@ wss.on('connection', ws => {
     });
 
     ws.on('close', () => {
-        // Handle player leaving the queue or an active game
         const index = waitingPlayers.indexOf(ws);
         if (index > -1) {
             waitingPlayers.splice(index, 1);
         }
+
+        activeGames.forEach((game, gameId) => {
+            const player = game.find(p => p === ws);
+            if (player) {
+                const opponent = game.find(p => p !== ws);
+                if (opponent && opponent.readyState === WebSocket.OPEN) {
+                    opponent.send(JSON.stringify({ type: 'finalResult', status: 'Your opponent disconnected. You win!' }));
+                    updateScore(opponent.user.username, 10);
+                }
+                activeGames.delete(gameId);
+            }
+        });
     });
 });
 
-// Update user score function
 const updateScore = async (username, points) => {
     try {
         await User.findOneAndUpdate(
@@ -205,7 +231,7 @@ const updateScore = async (username, points) => {
     }
 };
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
