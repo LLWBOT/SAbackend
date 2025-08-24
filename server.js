@@ -10,7 +10,7 @@ const User = require('./models/User');
 const app = express();
 
 const corsOptions = {
-    origin: 'https://shadowassasins.netlify.com'
+    origin: 'https://shadowassasins.netlify.app'
 };
 
 app.use(cors(corsOptions));
